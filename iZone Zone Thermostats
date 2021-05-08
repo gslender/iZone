@@ -1,0 +1,627 @@
+/*
+    iZone Air Conditioning Control Systems
+    Copyright (C) 2019-2020  Sha'ul ben Yeshua / Scott Grayban
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program; if not, write to the Free Software Foundation, Inc.,
+    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+import groovy.json.*
+
+metadata {
+	definition (
+		name: "iZone Zone Thermostats",
+		namespace: "sgrayban",
+		author: "Scott Grayban"
+		)
+	{
+        capability "Actuator"
+        capability "TemperatureMeasurement"
+        capability "Refresh"
+        capability "Polling"
+        capability "ThermostatSetpoint"
+        capability "ThermostatCoolingSetpoint"
+        capability "Thermostat"
+
+        attribute "LastRefresh", "string"
+        attribute "ZoneNumber", "number"
+        attribute "ZoneName", "string"
+        attribute "ZoneType", "string"
+        attribute "ZoneMode", "string"
+        attribute "ZoneSetpoint", "number"
+        attribute "DamperMaxOpen", "number"
+        attribute "DamperMinOpen", "number"
+
+        command "OpenDamper"
+        command "CloseDamper"
+        command "Damper25Percent"
+        command "Damper50Percent"
+        command "Damper75Percent"
+	}
+
+
+	preferences {
+	def refreshRate = [:]
+		refreshRate << ["1 min" : "Refresh every minute"]
+		refreshRate << ["5 min" : "Refresh every 5 minutes"]
+		refreshRate << ["15 min" : "Refresh every 15 minutes"]
+		refreshRate << ["30 min" : "Refresh every 30 minutes"]
+
+	input("ip", "string", title:"IP", description:"iZone Bridge IP ", defaultValue:"" , required: true)
+	input("zonenumber", "number", title: "Zone 1-12", description: "1 = Zone 1", defaultValue: true, required: true)
+    input("refresh_Rate", "enum", title: "Device Refresh Rate", options: refreshRate, defaultValue: "30 min")
+	input "locale", "enum", title: "Choose refresh date format", required: true, defaultValue: true, options: [US:"US MM/DD/YYYY",UK:"UK DD/MM/YYYY"]
+	input name: "debugOutput", type: "bool", title: "Enable debug logging?", defaultValue: true
+	input name: "debugParse", type: "bool", title: "Enable JSON parse logging?", defaultValue: true
+	input name: "txtEnable", type: "bool", title: "Enable descriptionText logging", defaultValue: true
+	}
+}
+
+def setVersion(){
+	state.Version = "1.0.0"
+	state.InternalName = "iZoneZoneThermostats"
+}
+
+def initialize() {
+	log.info "initialize"
+	if (txtEnable) log.info "initialize"
+}
+
+def installed() {
+    log.debug "Installed"
+}
+
+def uninstalled() {
+    unschedule()
+    log.debug "Uninstalled"
+}
+
+// dead commands here
+def setThermostatMode() { return null }
+def setThermostatFanMode() {return null}
+def emergencyHeat()  { return null }
+def off() { return null }
+def fanAuto() { return null }
+def heat() { return null }
+def cool() { return null }
+def fanCirculate() { return null }
+def fanon() { return null }
+
+def updated() {
+    if (txtEnable) log.info "Preferences updated..."
+    log.warn "Debug logging is: ${debugOutput == true}"
+    log.warn "Debug logging is: ${debugParse == true}"
+    unschedule()
+    dbCleanUp()
+    
+   switch(refresh_Rate) {
+		case "1 min" :
+			runEvery1Minute(autorefresh)
+			break
+		case "5 min" :
+			runEvery5Minutes(autorefresh)
+			break
+		case "15 min" :
+			runEvery15Minutes(autorefresh)
+			break
+		default:
+			runEvery30Minutes(autorefresh)
+	}
+	if (txtEnable) log.info ("Auto Refresh set for every ${refresh_Rate} minute(s).")
+
+    if (debugOutput) runIn(1800,logsOff)
+    if (debugParse) runIn(1800,logsOff)
+    
+    state.LastRefresh = new Date().format("YYYY/MM/dd \n HH:mm:ss", location.timeZone)
+    
+    refresh()
+}
+
+private dbCleanUp() {
+	state.remove("version")
+	state.remove("Version")
+}
+
+
+def refresh() {
+    if (zonenumber <= 4) {
+    if (txtEnable) log.info "refresh 1-4"
+    zone1_4()
+    }
+    if (zonenumber >= 5 || zonenumber <= 8) {
+    if (txtEnable) log.info "refresh 5-8"
+    zone5_8()
+    }
+    if (zonenumber >= 9) {
+    if (txtEnable) log.info "refresh 9-12"
+    zone9_12()
+    }
+    commonstatus()
+
+}
+
+def handleResponse(resp) {
+  logJSON "response data: ${resp.data}"
+  try {
+    if(resp.contentType) {
+      logJSON "response contentType: ${resp.contentType}"
+    }
+  } catch (e) {
+    logJSON "No contentType defined: $e"
+  }
+  JsonSlurper slurper = new JsonSlurper()
+  def obs = ''
+  try {
+    obs = slurper.parseText(new String(resp.data, "UTF-8"))
+    logJSON "Sucessfully parsed the JSON."
+  } catch (e) {
+    logJSON "Using alternate response parsing due to error: $e"
+    obs = resp.data
+  }
+  return obs
+}
+
+def zone1_4(){
+    if (txtEnable) log.info "Pulling Zone 1_4 Settings"
+    def params = [uri: "http://${ip}/Zones1_4"]
+
+try {
+    httpGet(params) {
+        resp -> resp.headers.each {
+        logJSON "Response: ${it.name} : ${it.value}"
+    }
+        logJSON "params: ${params}"
+        def obs = handleResponse(resp)
+	    
+
+        if (zonenumber == 1) {
+        state.ZoneNumber = obs.Index[0]
+        state.ZoneName = obs.Name[0]
+        
+        sendEvent(name: "ZoneType", value: obs.Type[0])
+        sendEvent(name: "ZoneMode", value: obs.Mode[0])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        state.temperature = obs.Temp[0].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[0])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[0])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        }
+        
+         if (zonenumber == 2) {
+        state.ZoneNumber = obs.Index[1]
+        state.ZoneName = obs.Name[1]
+
+        sendEvent(name: "ZoneType", value: obs.Type[1])
+        sendEvent(name: "ZoneMode", value: obs.Mode[1])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        state.temperature = obs.Temp[1].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[1])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[1])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        }
+       
+        if (zonenumber == 3) {
+        state.ZoneNumber = obs.Index[2]
+        state.ZoneName = obs.Name[2]
+
+        sendEvent(name: "ZoneType", value: obs.Type[2])
+        sendEvent(name: "ZoneMode", value: obs.Mode[2])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        state.temperature = obs.Temp[2].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[2])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[2])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        }
+
+        if (zonenumber == 4) {
+        state.ZoneNumber = obs.Index[3]
+        state.ZoneName = obs.Name[3]
+
+        sendEvent(name: "ZoneType", value: obs.Type[3])
+        sendEvent(name: "ZoneMode", value: obs.Mode[3])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        state.temperature = obs.Temp[3].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[3])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[3])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        }
+        
+        sendEvent(name: "temperature", value: state.temperature)
+        sendEvent(name: "ZoneNumber", value: state.ZoneNumber)
+        sendEvent(name: "ZoneName", value: state.ZoneName)
+
+} // End try
+       } catch (e) {
+           log.error "zone1_4() something went wrong: $e"
+       }
+} // End zones 1 -4
+
+
+def zone5_8(){
+    if (txtEnable) log.info "Pulling Zone 5_8 Settings"
+    def params = [uri: "http://${ip}/Zones5_8"]
+
+try {
+    httpGet(params) {
+        resp -> resp.headers.each {
+        logJSON "Response: ${it.name} : ${it.value}"
+    }
+        logJSON "params: ${params}"
+        def obs = handleResponse(resp)
+	    
+
+        if (zonenumber == 5) {
+        state.ZoneNumber = obs.Index[0]
+        state.ZoneName = obs.Name[0]
+
+        sendEvent(name: "ZoneType", value: obs.Type[0])
+        sendEvent(name: "ZoneMode", value: obs.Mode[0])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        state.temperature = obs.Temp[0].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[0])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[0])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        }
+        
+         if (zonenumber == 6) {
+        state.ZoneNumber = obs.Index[1]
+        state.ZoneName = obs.Name[1]
+
+        sendEvent(name: "ZoneType", value: obs.Type[1])
+        sendEvent(name: "ZoneMode", value: obs.Mode[1])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        state.temperature = obs.Temp[1].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[1])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[1])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        }
+       
+        if (zonenumber == 7) {
+        state.ZoneNumber = obs.Index[2]
+        state.ZoneName = obs.Name[2]
+
+        sendEvent(name: "ZoneType", value: obs.Type[2])
+        sendEvent(name: "ZoneMode", value: obs.Mode[2])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        state.temperature = obs.Temp[2].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[2])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[2])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        }
+
+        if (zonenumber == 8) {
+        state.ZoneNumber = obs.Index[3]
+        state.ZoneName = obs.Name[3]
+
+        sendEvent(name: "ZoneType", value: obs.Type[3])
+        sendEvent(name: "ZoneMode", value: obs.Mode[3])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        state.temperature = obs.Temp[3].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[3])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[3])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        }
+        
+        sendEvent(name: "temperature", value: state.temperature)
+        sendEvent(name: "ZoneNumber", value: state.ZoneNumber)
+        sendEvent(name: "ZoneName", value: state.ZoneName)
+
+} // End try
+       } catch (e) {
+           log.error "zone5_8() something went wrong: $e"
+       }
+} // End Zones 5-8
+
+
+def zone9_12(){
+    if (txtEnable) log.info "Pulling Zone 9_12 Settings"
+    def params = [uri: "http://${ip}/Zones9_12"]
+
+try {
+    httpGet(params) {
+        resp -> resp.headers.each {
+        logJSON "Response: ${it.name} : ${it.value}"
+    }
+        logJSON "params: ${params}"
+        def obs = handleResponse(resp)
+        
+        // logJSON "response contentType: ${resp.contentType}"
+	    
+
+        if (zonenumber == 9) {
+        state.ZoneNumber = obs.Index[0]
+        state.ZoneName = obs.Name[0]
+
+        sendEvent(name: "ZoneType", value: obs.Type[0])
+        sendEvent(name: "ZoneMode", value: obs.Mode[0])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        state.temperature = obs.Temp[0].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[0])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[0])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[0].toFloat().round(0))
+        }
+        
+         if (zonenumber == 10) {
+        state.ZoneNumber = obs.Index[1]
+        state.ZoneName = obs.Name[1]
+
+        sendEvent(name: "ZoneType", value: obs.Type[1])
+        sendEvent(name: "ZoneMode", value: obs.Mode[1])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        state.temperature = obs.Temp[1].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[1])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[1])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[1].toFloat().round(0))
+        }
+       
+        if (zonenumber == 11) {
+        state.ZoneNumber = obs.Index[2]
+        state.ZoneName = obs.Name[2]
+
+        sendEvent(name: "ZoneType", value: obs.Type[2])
+        sendEvent(name: "ZoneMode", value: obs.Mode[2])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        state.temperature = obs.Temp[2].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[2])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[2])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[2].toFloat().round(0))
+        }
+
+        if (zonenumber == 12) {
+        state.ZoneNumber = obs.Index[3]
+        state.ZoneName = obs.Name[3]
+
+        sendEvent(name: "ZoneType", value: obs.Type[3])
+        sendEvent(name: "ZoneMode", value: obs.Mode[3])
+        sendEvent(name: "ZoneSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        state.temperature = obs.Temp[3].toFloat().round(0)
+
+        sendEvent(name: "DamperMaxOpen", value: obs.MaxAir[3])
+        sendEvent(name: "DamperMinOpen", value: obs.MinAir[3])
+
+        sendEvent(name: "thermostatSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        sendEvent(name: "coolingSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        sendEvent(name: "heatingSetpoint", value: obs.SetPoint[3].toFloat().round(0))
+        }
+        
+        sendEvent(name: "temperature", value: state.temperature)
+        sendEvent(name: "ZoneNumber", value: state.ZoneNumber)
+        sendEvent(name: "ZoneName", value: state.ZoneName)
+
+} // End try
+       } catch (e) {
+           log.error "zone9_12() something went wrong: $e"
+       }
+} // End Zones 9-12
+
+def commonstatus(){
+ logDebug "Pulling System Settings"
+    def params = [uri: "http://${ip}/SystemSettings"]
+
+try {
+    httpGet(params) {
+        resp -> resp.headers.each {
+        logJSON "Response: ${it.name} : ${it.value}"
+    }
+        logJSON "params: ${params}"
+        def obs = handleResponse(resp)
+	    
+
+	    // Need to trim out useless info here
+        sendEvent(name: "thermostatMode", value: obs.SysMode)
+        sendEvent(name: "thermostatOperatingState", value: obs.SysMode)
+        state.thermostatMode = obs.SysMode
+        
+        sendEvent(name: "thermostatFanMode", value: obs.SysFan)
+        state.thermostatFanMode = obs.SysFan
+
+} // End try
+       } catch (e) {
+           log.error "commonstatus() something went wrong: $e"
+       }
+} // End common Status
+
+
+def logsOff(){
+	log.warn "debug logging auto disabled..."
+	device.updateSetting("debugOutput",[value:"false",type:"bool"])
+	device.updateSetting("debugParse",[value:"false",type:"bool"])
+}
+
+def autorefresh() {
+	if (locale == "UK") {
+	logDebug "Get last UK Date DD/MM/YYYY"
+	state.LastRefresh = new Date().format("d/MM/YYYY \n HH:mm:ss", location.timeZone)
+	sendEvent(name: "LastRefresh", value: state.LastRefresh, descriptionText: "Last refresh performed")
+	} 
+	if (locale == "US") {
+	logDebug "Get last US Date MM/DD/YYYY"
+	state.LastRefresh = new Date().format("MM/d/YYYY \n HH:mm:ss", location.timeZone)
+	sendEvent(name: "LastRefresh", value: state.LastRefresh, descriptionText: "Last refresh performed")
+	}
+	if (txtEnable) log.info "Executing 'auto refresh'"
+
+    refresh()
+}
+
+def poll() {
+	if (locale == "UK") {
+	logDebug "Get last UK Date DD/MM/YYYY"
+	state.LastRefresh = new Date().format("d/MM/YYYY \n HH:mm:ss", location.timeZone)
+	sendEvent(name: "LastRefresh", value: state.LastRefresh, descriptionText: "Last refresh performed")
+	} 
+	if (locale == "US") {
+	logDebug "Get last US Date MM/DD/YYYY"
+	state.LastRefresh = new Date().format("MM/d/YYYY \n HH:mm:ss", location.timeZone)
+	sendEvent(name: "LastRefresh", value: state.LastRefresh, descriptionText: "Last refresh performed")
+	}
+	if (txtEnable) log.info "Executing 'poll'"
+	refresh()
+}
+
+private logJSON(msg) {
+	if (settings?.debugParse || settings?.debugParse == null) {
+	log.info "$msg"
+	}
+}
+
+private logDebug(msg) {
+	if (settings?.debugOutput || settings?.debugOutput == null) {
+	log.debug "$msg"
+	}
+}
+
+def setHeatingSetpoint(temperature) {
+    sendSetpoint '{"ZoneCommand":{"ZoneNo":"' + zonenumber + '","Command":"' + temperature + '"}}'
+}
+def setCoolingSetpoint(temperature) {
+    sendSetpoint '{"ZoneCommand":{"ZoneNo":"' + zonenumber + '","Command":"' + temperature + '"}}'
+}
+def auto() {
+    sendSetpoint '{"ZoneCommand":{"ZoneNo":"' + zonenumber + '","Command":"auto"}}'
+}
+def sendSetpoint(jsonbody) {
+    if (txtEnable) log.info "Calling ${jsonbody}"
+    def params = [
+        uri: "http://${ip}",
+        path:"/ZoneCommand/",
+        headers: ["Content-Type": "application/json", "Application-Type": "application/json"],
+        body: jsonbody
+    ]
+    try {
+        logDebug "Posting ${params}"
+        httpPostJson(params) {
+            resp ->
+            logDebug "Received Response: ${resp.status}"
+    }
+} // End try
+        
+ catch (e) {
+     if("$e" !="groovyx.net.http.ResponseParseException: OK")
+     {
+         log.error "sendSetpoint() something went wrong: $e"
+     }
+ }
+    runIn(2, refresh)
+}
+
+def OpenDamper() {
+    sendOpenDamper '{"AirMaxCommand":{"ZoneNo":"' + zonenumber + '","Command":"100"}}'
+}
+def CloseDamper() {
+    sendCloseDamper '{"AirMinCommand":{"ZoneNo":"' + zonenumber + '","Command":"0"}}'
+}
+def Damper25Percent() {
+    sendCloseDamper '{"AirMinCommand":{"ZoneNo":"' + zonenumber + '","Command":"25"}}'
+}
+def Damper50Percent() {
+    sendCloseDamper '{"AirMinCommand":{"ZoneNo":"' + zonenumber + '","Command":"50"}}'
+}
+def Damper75Percent() {
+    sendCloseDamper '{"AirMinCommand":{"ZoneNo":"' + zonenumber + '","Command":"75"}}'
+}
+
+def sendOpenDamper(jsonbody) {
+    if (txtEnable) log.info "Calling ${jsonbody}"
+    def params = [
+        uri: "http://${ip}",
+        path:"/AirMaxCommand/",
+        headers: ["Content-Type": "application/json", "Application-Type": "application/json"],
+        body: jsonbody
+    ]
+    try {
+        logDebug "Posting ${params}"
+        httpPostJson(params) {
+            resp ->
+            logDebug "Received Response: ${resp.status}"
+    }
+} // End try
+        
+ catch (e) {
+     if("$e" !="groovyx.net.http.ResponseParseException: OK")
+     {
+         log.error "sendOpenDamper() something went wrong: $e"
+     }
+ }
+    runIn(2, refresh)
+}
+
+def sendCloseDamper(jsonbody) {
+    if (txtEnable) log.info "Calling ${jsonbody}"
+    def params = [
+        uri: "http://${ip}",
+        path:"/AirMinCommand/",
+        headers: ["Content-Type": "application/json", "Application-Type": "application/json"],
+        body: jsonbody
+    ]
+    try {
+        logDebug "Posting ${params}"
+        httpPostJson(params) {
+            resp ->
+            logDebug "Received Response: ${resp.status}"
+    }
+} // End try
+        
+ catch (e) {
+     if("$e" !="groovyx.net.http.ResponseParseException: OK")
+     {
+         log.error "sendCloseDamper() something went wrong: $e"
+     }
+ }
+    runIn(2, refresh)
+}
