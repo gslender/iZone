@@ -1,0 +1,521 @@
+/*
+    iZone Air Conditioning Control Systems
+    Copyright (C) 2019-2020  Sha'ul ben Yeshua / Scott Grayban
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program; if not, write to the Free Software Foundation, Inc.,
+    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+ NOTE!! These commands do not work on AirStream AC system
+        setSchedule //Not used in master panel but usable in the zones
+*/
+
+import groovy.json.*
+
+metadata {
+	definition (
+		name: "iZone Master Panel",
+		namespace: "sgrayban",
+		author: "Scott Grayban"
+		)
+	{
+        capability "Actuator"
+        capability "TemperatureMeasurement"
+        capability "Switch"
+        capability "Refresh"
+        capability "Polling"
+        capability "Thermostat"
+        capability "ThermostatSetpoint"
+        capability "ThermostatCoolingSetpoint"
+        capability "PresenceSensor"
+
+
+// There duplicate attributes needed for the Thermostat capability
+        attribute "LastRefresh", "string"
+        attribute "AirStreamDeviceUId", "number"
+        attribute "SysMode", "string"
+        attribute "SysFan", "string"
+        attribute "SleepTimer", "number"
+        attribute "SupplyTemp", "number"
+        attribute "CtrlZone", "number"
+        attribute "Warnings", "string"
+        attribute "ACError", "string"
+        
+        attribute "EcoLock", "string"
+        attribute "EcoMaxTemp", "number"
+        attribute "EcoMinTemp", "number"
+        
+        attribute "NoOfConst", "number"
+        attribute "NoOfZones", "number"
+        attribute "AirflowLock", "string"
+        attribute "UnitLocked", "string"
+        attribute "FanAuto", "string"
+        attribute "UnitType", "string"
+        attribute "RAS", "string"
+        attribute "Installer", "string"
+        attribute "InstallerNumber", "string"
+        attribute "IncomingAirTemp", "number"
+
+        command "SysModeCool"
+        command "SysModeHeat"
+        command "SysModeVent"
+        command "SysModeDry"
+        command "SysModeAuto"
+        
+        command "fanLow"
+        command "fanMedium"
+        command "fanHigh"
+        command "fanAuto"
+        command "fanCirculate"
+	}
+
+
+	preferences {
+	def refreshRate = [:]
+		refreshRate << ["1 min" : "Refresh every minute"]
+		refreshRate << ["5 min" : "Refresh every 5 minutes"]
+		refreshRate << ["15 min" : "Refresh every 15 minutes"]
+		refreshRate << ["30 min" : "Refresh every 30 minutes"]
+
+	input("ip", "string", title:"IP", description:"iZone Bridge IP ", defaultValue:"" , required: true)
+	input name: "password", type: "password", title: "Password:", description: "(blank if none)", required: false
+    input("refresh_Rate", "enum", title: "Device Refresh Rate", options: refreshRate, defaultValue: "30 min")
+	input "locale", "enum", title: "Choose refresh date format", required: true, defaultValue: true, options: [US:"US MM/DD/YYYY",UK:"UK DD/MM/YYYY"]
+	input name: "debugOutput", type: "bool", title: "Enable debug logging?", defaultValue: true
+	input name: "debugParse", type: "bool", title: "Enable JSON parse logging?", defaultValue: true
+	input name: "txtEnable", type: "bool", title: "Enable descriptionText logging", defaultValue: true
+	}
+}
+
+def setVersion(){
+	state.Version = "1.0.0"
+	state.InternalName = "iZoneMasterPanel"
+}
+
+def initialize() {
+	log.info "initialize"
+	if (txtEnable) log.info "initialize"
+}
+
+def installed() {
+    log.debug "Installed"
+}
+
+def uninstalled() {
+    unschedule()
+    log.debug "Uninstalled"
+}
+
+
+def updated() {
+    if (txtEnable) log.info "Preferences updated..."
+    log.warn "Debug logging is: ${debugOutput == true}"
+    log.warn "Debug logging is: ${debugParse == true}"
+    unschedule()
+    dbCleanUp()
+    
+   switch(refresh_Rate) {
+		case "1 min" :
+			runEvery1Minute(autorefresh)
+			break
+		case "5 min" :
+			runEvery5Minutes(autorefresh)
+			break
+		case "15 min" :
+			runEvery15Minutes(autorefresh)
+			break
+		default:
+			runEvery30Minutes(autorefresh)
+	}
+	if (txtEnable) log.info ("Auto Refresh set for every ${refresh_Rate} minute(s).")
+
+    if (debugOutput) runIn(1800,logsOff)
+    if (debugParse) runIn(1800,logsOff)
+    
+    state.LastRefresh = new Date().format("YYYY/MM/dd \n HH:mm:ss", location.timeZone)
+    
+    refresh()
+}
+
+private dbCleanUp() {
+	state.remove("version")
+	state.remove("Version")
+}
+
+def handleResponse(resp) {
+  logJSON "response data: ${resp.data}"
+  try {
+    if(resp.contentType) {
+      logJSON "response contentType: ${resp.contentType}"
+    }
+  } catch (e) {
+    logJSON "No contentType defined: $e"
+  }
+  JsonSlurper slurper = new JsonSlurper()
+  def obs = ''
+  try {
+    obs = slurper.parseText(new String(resp.data, "UTF-8"))
+    logJSON "Sucessfully parsed the JSON."
+  } catch (e) {
+    logJSON "Using alternate response parsing due to error: $e"
+    obs = resp.data
+  }
+  return obs
+}
+
+def refresh(){
+    zone1()
+    logDebug "Pulling System Settings"
+    def params = [uri: "http://${ip}:80/SystemSettings"]
+
+try {
+    httpGet(params) {
+        resp -> resp.headers.each {
+        logJSON "Response: ${it.name} : ${it.value}"
+    }
+        logJSON "refresh() params: ${params}"
+        def obs = handleResponse(resp)
+  
+        sendEvent(name: "presence", value: "present")
+
+        // Need to trim out useless info here
+        sendEvent(name:"AirStreamDeviceUId", value: obs.AirStreamDeviceUId)
+        updateDataValue ("AirStreamDeviceUId", obs.AirStreamDeviceUId)
+        
+        sendEvent(name:"switch", value: obs.SysOn)
+        sendEvent(name:"SysMode", value: obs.SysMode)
+
+        sendEvent(name: "thermostatMode", value: obs.SysMode)
+        sendEvent(name: "thermostatOperatingState", value: obs.SysMode)
+        state.thermostatMode = obs.SysMode
+        
+        sendEvent(name: "temperature", value: state.temperature)
+
+        sendEvent(name:"SysFan", value: obs.SysFan)
+        sendEvent(name: "thermostatFanMode", value: obs.SysFan)
+        state.thermostatFanMode = obs.SysFan
+        
+        sendEvent(name: "SleepTimer", value: obs.SleepTimer)
+        
+        sendEvent(name: "UnitType", value: obs.UnitType)
+        updateDataValue ("UnitType", obs.UnitType)
+        
+        sendEvent(name: "SupplyTemp", value: obs.Supply)
+        sendEvent(name: "IncomingAirTemp", value: obs.Supply)
+        state.IncomingAirTemp = obs.Supply
+
+        sendEvent(name: "thermostatSetpoint", value: obs.Setpoint)
+        sendEvent(name: "coolingSetpoint", value: obs.Setpoint)
+        sendEvent(name: "heatingSetpoint", value: obs.Setpoint)
+        
+        sendEvent(name: "RAS", value: obs.RAS)
+        sendEvent(name: "CtrlZone", value: obs.CtrlZone)
+        
+        if (obs.Warnings == "none") {
+        sendEvent(name: "Warnings", value: obs.Warnings)
+        } else
+        if (obs.Warnings == "filter") {
+        sendEvent(name: "Warnings", value: "Filter Warning")
+        }
+        
+        if (obs.ACError == " OK") {
+        sendEvent(name: "ACError", value: obs.ACError)
+        } else
+        if (obs.ACError != " OK") {
+        sendEvent(name: "ACError", value: "AC Error: " + obs.ACError)
+        }
+        
+        sendEvent(name: "EcoLock", value: obs.EcoLock)
+        sendEvent(name: "EcoMaxTemp", value: obs.EcoMax)
+        sendEvent(name: "EcoMinTemp", value: obs.EcoMin)
+        
+        sendEvent(name: "NoOfConst", value: obs.NoOfConst)
+        sendEvent(name: "NoOfZones", value: obs.NoOfZones)
+        sendEvent(name: "AirflowLock", value: obs.AirflowLock)
+        sendEvent(name: "UnitLocked", value: obs.UnitLocked)
+        sendEvent(name: "FanAuto", value: obs.FanAuto)
+        
+        sendEvent(name: "Installer", value: obs.Tag1)
+        sendEvent(name: "InstallerNumber", value: obs.Tag2)
+        updateDataValue ("Installer", obs.Tag1)
+        updateDataValue ("InstallerNumber", obs.Tag2)
+        
+        updateDataValue ("IP", "${ip}")
+        state.BridgeIP = "${ip}"
+
+} // End try
+       } catch (e) {
+         log.error "refresh() something went wrong: $e"
+         sendEvent(name: "presence", value: "not present")
+       }
+} // End Refresh Status
+
+
+
+def zone1(){
+    if (txtEnable) log.info "Pulling Zone 1 Settings"
+    def params = [uri: "http://${ip}/Zones1_4"]
+
+try {
+    httpGet(params) {
+        resp -> resp.headers.each {
+        logJSON "Response: ${it.name} : ${it.value}"
+    }
+      logJSON "params: ${params}"
+      def obs = handleResponse(resp)
+	    
+
+	    state.temperature = obs.Temp[0].toFloat().round(0)
+
+} // End try
+       } catch (e) {
+           log.error "zone1() something went wrong: $e"
+       }
+} // End zones 1 -4
+
+def logsOff(){
+	log.warn "debug logging auto disabled..."
+	device.updateSetting("debugOutput",[value:"false",type:"bool"])
+	device.updateSetting("debugParse",[value:"false",type:"bool"])
+}
+
+def autorefresh() {
+	if (locale == "UK") {
+	logDebug "Get last UK Date DD/MM/YYYY"
+	state.LastRefresh = new Date().format("d/MM/YYYY \n HH:mm:ss", location.timeZone)
+	sendEvent(name: "LastRefresh", value: state.LastRefresh, descriptionText: "Last refresh performed")
+	} 
+	if (locale == "US") {
+	logDebug "Get last US Date MM/DD/YYYY"
+	state.LastRefresh = new Date().format("MM/d/YYYY \n HH:mm:ss", location.timeZone)
+	sendEvent(name: "LastRefresh", value: state.LastRefresh, descriptionText: "Last refresh performed")
+	}
+	if (txtEnable) log.info "Executing 'auto refresh'"
+
+    refresh()
+}
+
+def poll() {
+	if (locale == "UK") {
+	logDebug "Get last UK Date DD/MM/YYYY"
+	state.LastRefresh = new Date().format("d/MM/YYYY \n HH:mm:ss", location.timeZone)
+	sendEvent(name: "LastRefresh", value: state.LastRefresh, descriptionText: "Last refresh performed")
+	} 
+	if (locale == "US") {
+	logDebug "Get last US Date MM/DD/YYYY"
+	state.LastRefresh = new Date().format("MM/d/YYYY \n HH:mm:ss", location.timeZone)
+	sendEvent(name: "LastRefresh", value: state.LastRefresh, descriptionText: "Last refresh performed")
+	}
+	if (txtEnable) log.info "Executing 'poll'"
+	refresh()
+}
+
+private logJSON(msg) {
+	if (settings?.debugParse || settings?.debugParse == null) {
+	log.info "$msg"
+	}
+}
+
+private logDebug(msg) {
+	if (settings?.debugOutput || settings?.debugOutput == null) {
+	log.debug "$msg"
+	}
+}
+
+def on() {
+    logDebug "Executing switch on"
+    sendCommandOn '{"SystemON":"on"}'
+}
+
+def off() {
+    logDebug "Executing switch off"
+    sendCommandOn '{"SystemON":"off"}'
+}
+
+def setThermostatMode(String value) {
+    logDebug "setThermostatMode to {$value}"
+    "$value"()
+}
+
+def cool() {
+    SysModeCool()
+}
+def SysModeCool() {
+    sendCommand '{"SystemMODE":"cool"}'
+}
+
+def heat() {
+    SysModeHeat()
+}
+def SysModeHeat() {
+    sendCommand '{"SystemMODE":"heat"}'
+}
+
+def auto() {
+    SysModeAuto()
+}
+
+def SysModeAuto() {
+    sendCommand '{"SystemMODE":"auto"}'
+}
+
+// fan control
+def setThermostatFanMode(String value) {
+    logDebug "setThermostatMode to {$value}"
+    "fan$value"()
+}
+
+def fanCirculate() {
+    SysModeVent()
+}
+def SysModeVent() {
+    sendCommand '{"SystemMODE":"vent"}'
+}
+
+def SysModeDry() {
+    sendCommand '{"SystemMODE":"dry"}'
+}
+
+def fanLow() {
+    sendFan '{"SystemFAN":"low"}'
+}
+
+def fanMedium() {
+    sendFan '{"SystemFAN":"medium"}'
+}
+
+def fanHigh() {
+    sendFan '{"SystemFAN":"high"}'
+}
+
+def fanOn() {
+    sendFan '{"SystemFAN":"auto"}'
+}
+def fanAuto() {
+    sendFan '{"SystemFAN":"auto"}'
+}
+
+// These commands do not work on AirStream AC system
+def setSchedule(JSON_OBJECT) { return null } //Not used in master panel but usable in the zones
+
+def emergencyHeat() {
+    SysModeHeat()
+    fanHigh()
+}
+
+def sendFan(jsonbody) {
+    if (txtEnable) log.info "Calling ${jsonbody}"
+    def params = [
+        uri: "http://${ip}",
+        path:"/SystemFAN/",
+        headers: ["Content-Type": "application/json", "Application-Type": "application/json"],
+        body: jsonbody
+    ]
+    try {
+        logDebug "Posting ${params}"
+        httpPostJson(params) {
+            resp ->
+            logDebug "Received Response: ${resp.status}"
+    }
+} // End try
+        
+ catch (e) {
+     if("$e" !="groovyx.net.http.ResponseParseException: OK")
+     {
+         log.error "sendFan() something went wrong: $e"
+     }
+ }
+    runIn(2, refresh)
+}
+
+def setHeatingSetpoint(temperature) {
+    sendSetpoint '{"UnitSetpoint":"' + temperature + '"}'
+}
+def setCoolingSetpoint(temperature) {
+    sendSetpoint '{"UnitSetpoint":"' + temperature + '"}'
+}
+
+def sendSetpoint(jsonbody) {
+    if (txtEnable) log.info "Calling ${jsonbody}"
+    def params = [
+        uri: "http://${ip}",
+        path:"/UnitSetpoint/",
+        headers: ["Content-Type": "application/json", "Application-Type": "application/json"],
+        body: jsonbody
+    ]
+    try {
+        logDebug "Posting ${params}"
+        httpPostJson(params) {
+            resp ->
+            logDebug "Received Response: ${resp.status}"
+    }
+} // End try
+        
+ catch (e) {
+     if("$e" !="groovyx.net.http.ResponseParseException: OK")
+     {
+         log.error "sendSetpoint() something went wrong: $e"
+     }
+ }
+    runIn(2, refresh)
+}
+
+def sendCommandOn(jsonbody) {
+    if (txtEnable) log.info "Calling system on"
+    def params = [
+        uri: "http://${ip}",
+        path:"/SystemON/",
+        headers: ["Content-Type": "application/json", "Application-Type": "application/json"],
+        body: jsonbody
+    ]
+    try {
+        logDebug "Posting ${params}"
+        httpPostJson(params) {
+            resp ->
+            logDebug "Received Response: ${resp.status}"
+    }
+} // End try
+        
+ catch (e) {
+     if("$e" !="groovyx.net.http.ResponseParseException: OK")
+     {
+         log.error "sendCommandOn() something went wrong: $e"
+     }
+ }
+    runIn(2, refresh)
+}
+
+def sendCommand(jsonbody) {
+    if (txtEnable) log.info "Calling ${jsonbody}"
+    def params = [
+        uri: "http://${ip}",
+        path:"/SystemMODE/",
+        headers: ["Content-Type": "application/json", "Application-Type": "application/json"],
+        body: jsonbody
+    ]
+    try {
+        logDebug "Posting ${params}"
+        httpPostJson(params) {
+            resp ->
+            logDebug "Received Response: ${resp.status}"
+    }
+} // End try
+        
+ catch (e) {
+     if("$e" !="groovyx.net.http.ResponseParseException: OK")
+     {
+         log.error "sendCommand() something went wrong: $e"
+     }
+ }
+        runIn(2, refresh)
+}
